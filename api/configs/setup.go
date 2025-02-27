@@ -2,11 +2,12 @@ package configs
 
 import (
 	"context"
-	"fmt"
-	"log"
+	"os"
 	"strconv"
+	"sync"
 	"time"
 
+	"github.com/UTDNebula/nebula-api/api/common/log"
 	"github.com/gin-gonic/gin"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -14,34 +15,45 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-func ConnectDB() *mongo.Client {
-	client, err := mongo.NewClient(options.Client().ApplyURI(GetEnvMongoURI()))
-	if err != nil {
-		log.Fatalf("Unable to create MongoDB client: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	err = client.Connect(ctx)
-	if err != nil {
-		log.Fatalf("Unable to connect to database: %v", err)
-	}
-
-	//ping the database
-	err = client.Ping(ctx, nil)
-	if err != nil {
-		log.Fatalf("Unable to ping database: %v", err)
-	}
-	fmt.Println("Connected to MongoDB")
-	return client
+type DBSingleton struct {
+	client *mongo.Client
 }
 
-// Client instance
-var DB *mongo.Client = ConnectDB()
+var dbInstance *DBSingleton
+var once sync.Once
+
+func ConnectDB() *mongo.Client {
+	once.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+
+		client, err := mongo.Connect(context.Background(), options.Client().ApplyURI(GetEnvMongoURI()))
+		if err != nil {
+			log.WriteErrorMsg("Unable to create MongoDB client")
+			os.Exit(1)
+		}
+
+		defer cancel()
+
+		//ping the database
+		err = client.Ping(ctx, nil)
+		if err != nil {
+			log.WriteErrorMsg("Unable to ping database")
+			os.Exit(1)
+		}
+
+		log.WriteDebug("Connected to MongoDB")
+
+		dbInstance = &DBSingleton{
+			client: client,
+		}
+	})
+
+	return dbInstance.client
+}
 
 // getting database collections
-func GetCollection(client *mongo.Client, collectionName string) *mongo.Collection {
+func GetCollection(collectionName string) *mongo.Collection {
+	client := ConnectDB()
 	collection := client.Database("combinedDB").Collection(collectionName)
 	return collection
 }
@@ -66,4 +78,33 @@ func GetOptionLimit(query *bson.M, c *gin.Context) (*options.FindOptions, error)
 	}
 
 	return options.Find().SetSkip(offset).SetLimit(limit), err
+}
+
+// Returns the offsets and limit for pagination stage for aggregate endpoints pipeline (map, err)
+func GetAggregateLimit(query *bson.M, c *gin.Context) (map[string]int64, error) {
+	// remove formerOffset and latterOffset field (if present) in the query
+	delete(*query, "former_offset")
+	delete(*query, "latter_offset")
+
+	// parses offsets if included in the query
+	paginateMap := map[string]int64{
+		"former_offset": 0, // initialize the default value of offset & limit right in the map
+		"latter_offset": 0,
+		"limit":         GetEnvLimit(),
+	}
+	var err error
+
+	// loop through offset types (keys indicating offset values)
+	for key := range paginateMap {
+		// only change values of the map if specified
+		if key != "limit" && c.Query(key) != "" {
+			offset, parseErr := strconv.ParseInt(c.Query(key), 10, 64)
+			if parseErr != nil {
+				return paginateMap, parseErr // return default value of offset
+			}
+			paginateMap[key] = offset
+		}
+	}
+
+	return paginateMap, err
 }
